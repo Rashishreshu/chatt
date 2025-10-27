@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>P2P WebRTC Chat Client</title>
+    <!-- Load Tailwind CSS for styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #f7f9fb; }
+        .chat-container { max-width: 900px; }
+        .chat-box { height: 400px; }
+        .btn-primary {
+            background-color: #4f46e5;
+            color: white;
+            padding: 0.75rem 1.5rem;
+            border-radius: 0.5rem;
+            font-weight: 600;
+            transition: all 0.2s;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.1);
+        }
+        .btn-primary:hover { background-color: #4338ca; }
+    </style>
+</head>
+<body class="flex items-center justify-center min-h-screen p-4">
+
+    <div class="chat-container w-full bg-white rounded-xl shadow-2xl p-6 space-y-6">
+        
+        <!-- Header -->
+        <h1 class="text-3xl font-bold text-center text-indigo-600 border-b pb-3 mb-4">Real-Time P2P Chat</h1>
+
+        <!-- Status and ID Display -->
+        <div class="flex justify-between items-center text-sm font-medium mb-4">
+            <span id="status" class="px-3 py-1 rounded-full bg-red-100 text-red-700">Status: Connecting to Server...</span>
+            <span class="text-gray-500">Your ID: <span id="localId" class="font-mono text-gray-800"></span></span>
+        </div>
+
+        <!-- Chat Area -->
+        <div id="chat-box" class="chat-box overflow-y-auto bg-gray-50 border border-gray-200 rounded-lg p-4 space-y-3">
+            <p id="initial-message" class="text-gray-400 text-center">Waiting for peer connection via signaling server...</p>
+        </div>
+
+        <!-- Message Input -->
+        <div class="flex space-x-3">
+            <input type="text" id="message-input" placeholder="Type a message..." disabled
+                   class="flex-grow p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 disabled:bg-gray-100">
+            <button id="send-btn" class="btn-primary disabled:opacity-50" disabled>Send</button>
+        </div>
+        
+        <!-- Connection button (for testing/re-connecting) -->
+        <button id="connect-btn" class="btn-primary w-full disabled:opacity-50 mt-4">Connect/Retry Server</button>
+
+        <p class="text-xs text-center text-red-500 mt-2">
+            NOTE: You MUST run the 'backend.js' file using Node.js first for this chat to work.
+        </p>
+    </div>
+
+    <script>
+        const chatBox = document.getElementById('chat-box');
+        const messageInput = document.getElementById('message-input');
+        const sendBtn = document.getElementById('send-btn');
+        const statusEl = document.getElementById('status');
+        const localIdEl = document.getElementById('localId');
+        const connectBtn = document.getElementById('connect-btn');
+        const initialMessageEl = document.getElementById('initial-message');
+
+        const SERVER_URL = 'ws://localhost:8080';
+        const localId = 'User-' + Math.random().toString(36).substring(2, 8).toUpperCase();
+        localIdEl.textContent = localId;
+
+        let peerConnection;
+        let dataChannel;
+        let ws;
+        let isMakingOffer = false;
+
+        // WebRTC Configuration
+        const configuration = {
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' } // Public STUN server
+            ]
+        };
+
+        function displayMessage(sender, message, isLocal = false) {
+            // Remove the initial prompt message if it exists
+            if (initialMessageEl) initialMessageEl.remove();
+
+            const time = new Date().toLocaleTimeString();
+            const color = isLocal ? 'bg-indigo-500 text-white' : 'bg-gray-200 text-gray-800';
+
+            const messageHtml = `
+                <div class="flex flex-col ${isLocal ? 'items-end' : 'items-start'}">
+                    <div class="text-xs text-gray-500 mb-0.5">${sender} <span class="text-gray-400">(${time})</span></div>
+                    <div class="max-w-xs p-3 rounded-lg shadow-md ${color}">
+                        ${message}
+                    </div>
+                </div>
+            `;
+            chatBox.innerHTML += messageHtml;
+            chatBox.scrollTop = chatBox.scrollHeight;
+        }
+
+        function updateStatus(newStatus, colorClass, peerConnected = false) {
+            statusEl.textContent = `Status: ${newStatus}`;
+            statusEl.className = `px-3 py-1 rounded-full text-sm font-medium ${colorClass}`;
+            
+            // Enable/Disable chat based on peer connection status
+            messageInput.disabled = !peerConnected;
+            sendBtn.disabled = !peerConnected;
+        }
+        
+        function sendMessage() {
+            const message = messageInput.value.trim();
+            if (message && dataChannel && dataChannel.readyState === 'open') {
+                try {
+                    dataChannel.send(JSON.stringify({ type: 'chat', message: message }));
+                    displayMessage(localId, message, true);
+                    messageInput.value = '';
+                } catch (error) {
+                    console.error("Error sending message:", error);
+                    updateStatus("Error Sending (Check Peer)", "bg-yellow-100 text-yellow-700", true);
+                }
+            }
+        }
+
+        function initializePeerConnection(isInitiator) {
+            peerConnection = new RTCPeerConnection(configuration);
+
+            // Handle ICE Candidates: Send them to the peer via the WebSocket server
+            peerConnection.onicecandidate = ({ candidate }) => {
+                if (candidate) {
+                    console.log('Sending ICE candidate:', candidate);
+                    ws.send(JSON.stringify({
+                        type: 'candidate',
+                        candidate: candidate,
+                        sender: localId
+                    }));
+                }
+            };
+            
+            // Handle connection state changes
+            peerConnection.onconnectionstatechange = () => {
+                const state = peerConnection.connectionState;
+                console.log('Peer connection state:', state);
+                if (state === 'connected') {
+                    updateStatus("Connected to Peer!", "bg-green-100 text-green-700", true);
+                    displayMessage("System", "Peer connection established.", false);
+                } else if (state === 'disconnected' || state === 'failed' || state === 'closed') {
+                    updateStatus("Peer Disconnected", "bg-red-100 text-red-700", false);
+                    displayMessage("System", "Peer connection lost. Refresh to retry.", false);
+                    // Clean up
+                    dataChannel = null;
+                    peerConnection.close();
+                }
+            };
+
+            if (isInitiator) {
+                // If we are the initiator, create the data channel
+                dataChannel = peerConnection.createDataChannel('chat');
+                setupDataChannel(dataChannel, localId);
+            } else {
+                // If we are the receiver, listen for the data channel
+                peerConnection.ondatachannel = (event) => {
+                    dataChannel = event.channel;
+                    setupDataChannel(dataChannel, localId);
+                };
+            }
+        }
+
+        function setupDataChannel(channel, peerName) {
+            console.log('Data Channel setup started');
+            
+            channel.onopen = () => {
+                console.log('Data Channel OPEN');
+                updateStatus("P2P Chat Active", "bg-green-100 text-green-700", true);
+                displayMessage("System", "P2P data channel ready. You can now chat.", false);
+            };
+
+            channel.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                if (data.type === 'chat') {
+                    displayMessage(`Peer (${data.sender})`, data.message, false);
+                } else if (data.type === 'id_exchange') {
+                    // Update the sender name if needed, though we primarily use the message sender ID
+                    console.log("Peer ID received:", data.id);
+                }
+            };
+
+            channel.onclose = () => {
+                console.log('Data Channel CLOSED');
+                updateStatus("Peer Disconnected", "bg-red-100 text-red-700", false);
+            };
+            
+            // Send our ID right after opening for the peer to display
+            channel.onopen = () => {
+                channel.send(JSON.stringify({ type: 'id_exchange', id: localId }));
+                console.log('Data Channel OPEN and ID sent');
+                updateStatus("P2P Chat Active", "bg-green-100 text-green-700", true);
+                displayMessage("System", "P2P data channel ready. You can now chat.", false);
+            };
+        }
+
+        async function createOffer() {
+            try {
+                isMakingOffer = true;
+                const offer = await peerConnection.createOffer();
+                await peerConnection.setLocalDescription(offer);
+                // Send the Offer SDP to the peer via the WebSocket server
+                ws.send(JSON.stringify({
+                    type: 'offer',
+                    sdp: peerConnection.localDescription,
+                    sender: localId
+                }));
+                updateStatus("Offer Sent, Waiting for Answer...", "bg-blue-100 text-blue-700", false);
+                console.log('Offer sent:', peerConnection.localDescription);
+            } catch (error) {
+                console.error('Error creating offer:', error);
+            }
+        }
+
+        async function createAnswer(offerSdp) {
+            try {
+                await peerConnection.setRemoteDescription(offerSdp);
+                const answer = await peerConnection.createAnswer();
+                await peerConnection.setLocalDescription(answer);
+                // Send the Answer SDP back to the peer via the WebSocket server
+                ws.send(JSON.stringify({
+                    type: 'answer',
+                    sdp: peerConnection.localDescription,
+                    sender: localId
+                }));
+                updateStatus("Answer Sent, Establishing P2P...", "bg-indigo-100 text-indigo-700", false);
+                console.log('Answer sent:', peerConnection.localDescription);
+            } catch (error) {
+                console.error('Error creating answer:', error);
+            }
+        }
+
+        async function handleSignalingMessage(message) {
+            const data = JSON.parse(message.data);
+            
+            if (data.sender === localId) return; // Ignore messages from self
+
+            if (data.type === 'offer') {
+                console.log('Received Offer:', data.sdp);
+                updateStatus("Received Offer, Creating Answer...", "bg-yellow-100 text-yellow-700", false);
+                // Receiver initializes and creates an answer
+                initializePeerConnection(false); 
+                await createAnswer(data.sdp);
+
+            } else if (data.type === 'answer') {
+                console.log('Received Answer:', data.sdp);
+                // Initiator sets the remote description (the Answer)
+                if (peerConnection && peerConnection.signalingState !== 'stable') {
+                    await peerConnection.setRemoteDescription(data.sdp);
+                    updateStatus("Answer Received, Exchanging ICE...", "bg-teal-100 text-teal-700", false);
+                }
+
+            } else if (data.type === 'candidate') {
+                console.log('Received ICE Candidate:', data.candidate);
+                try {
+                    const candidate = new RTCIceCandidate(data.candidate);
+                    await peerConnection.addIceCandidate(candidate);
+                } catch (e) {
+                    // Ignore error if candidate failed to add (e.g., if setRemoteDescription hasn't finished)
+                    console.warn('Error adding ICE candidate (normal during race condition):', e);
+                }
+            }
+        }
+
+        function startSignaling() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.close();
+            }
+            
+            updateStatus("Connecting to Server...", "bg-red-100 text-red-700", false);
+            connectBtn.disabled = true;
+
+            ws = new WebSocket(SERVER_URL);
+
+            ws.onopen = () => {
+                updateStatus("Connected to Signaling Server", "bg-blue-100 text-blue-700", false);
+                console.log('Connected to signaling server');
+                // Send our ID to the server
+                ws.send(JSON.stringify({ type: 'register', id: localId }));
+                
+                // If we are the only one, we just wait. If a second user connects, the server will tell us to start.
+            };
+
+            ws.onmessage = (message) => {
+                const data = JSON.parse(message.data);
+                
+                if (data.type === 'start_offer' && !peerConnection && !isMakingOffer) {
+                    // This is the signal from the server to start the connection process (become the initiator)
+                    console.log('Server requested us to initiate offer.');
+                    initializePeerConnection(true);
+                    createOffer();
+                } else {
+                    handleSignalingMessage(message);
+                }
+            };
+
+            ws.onerror = (error) => {
+                console.error('WebSocket Error:', error);
+                updateStatus("Server Error", "bg-gray-100 text-gray-700", false);
+                connectBtn.disabled = false;
+            };
+
+            ws.onclose = () => {
+                console.log('WebSocket Closed');
+                if (peerConnection && peerConnection.connectionState !== 'connected') {
+                    updateStatus("Server Disconnected. Cannot find peer.", "bg-gray-100 text-gray-700", false);
+                }
+                connectBtn.disabled = false;
+            };
+        }
+
+        // --- Event Listeners ---
+        sendBtn.addEventListener('click', sendMessage);
+        messageInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                sendMessage();
+            }
+        });
+        connectBtn.addEventListener('click', startSignaling);
+
+        // Start connection attempt on load
+        window.onload = startSignaling;
+    </script>
+</body>
+</html>
